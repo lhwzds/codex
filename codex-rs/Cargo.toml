@@ -12,8 +12,6 @@ members = [
     "feedback",
     "codex-backend-openapi-models",
     "cloud-requirements",
-    "cloud-tasks",
-    "cloud-tasks-client",
     "cli",
     "config",
     "shell-command",
