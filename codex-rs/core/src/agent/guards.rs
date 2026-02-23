@@ -127,6 +127,17 @@ impl Guards {
         Some(agent_nickname)
     }
 
+    /// Returns the set of currently registered thread IDs that were spawned via this session's
+    /// Guards. A thread ID in this set may no longer correspond to a live thread (it could have
+    /// been externally shutdown). Callers should handle missing-thread errors gracefully.
+    pub(crate) fn active_thread_ids(&self) -> Vec<ThreadId> {
+        let active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active_agents.threads_set.iter().copied().collect()
+    }
+
     fn try_increment_spawned(&self, max_threads: usize) -> bool {
         let mut current = self.total_count.load(Ordering::Acquire);
         loop {

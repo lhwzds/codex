@@ -646,7 +646,7 @@ fn create_wait_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches his final status, a notification message will be received containing the same completed status."
+        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Includes token_usage per agent that reached a final status. Once the agent reaches his final status, a notification message will be received containing the same completed status."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -733,6 +733,53 @@ fn create_request_user_input_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["questions".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_cancel_agents_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "ids".to_string(),
+            JsonSchema::Array {
+                items: Box::new(JsonSchema::String { description: None }),
+                description: Some(
+                    "Agent ids to cancel. Provide either 'ids' or set 'all' to true.".to_string(),
+                ),
+            },
+        ),
+        (
+            "all".to_string(),
+            JsonSchema::Boolean {
+                description: Some("When true, cancel all running agents.".to_string()),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "cancel_agents".to_string(),
+        description: "Cancel one or more running agents by id, or cancel all running agents."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_list_agents_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "list_agents".to_string(),
+        description:
+            "List all active sub-agents with their status, role, token usage, and available capacity (max_threads, available_slots)."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
             additional_properties: Some(false.into()),
         },
     })
@@ -1570,11 +1617,15 @@ pub(crate) fn build_specs(
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
+        builder.push_spec(create_list_agents_tool());
+        builder.push_spec(create_cancel_agents_tool());
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
         builder.register_handler("wait", multi_agent_handler.clone());
-        builder.register_handler("close_agent", multi_agent_handler);
+        builder.register_handler("close_agent", multi_agent_handler.clone());
+        builder.register_handler("list_agents", multi_agent_handler.clone());
+        builder.register_handler("cancel_agents", multi_agent_handler);
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1849,6 +1900,8 @@ mod tests {
                 "resume_agent",
                 "wait",
                 "close_agent",
+                "list_agents",
+                "cancel_agents",
             ],
         );
     }

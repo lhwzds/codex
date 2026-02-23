@@ -303,6 +303,11 @@ impl AgentControl {
         });
     }
 
+    /// Returns the list of active sub-agent thread IDs.
+    pub(crate) fn active_thread_ids(&self) -> Vec<ThreadId> {
+        self.state.active_thread_ids()
+    }
+
     fn upgrade(&self) -> CodexResult<Arc<ThreadManagerState>> {
         self.manager
             .upgrade()

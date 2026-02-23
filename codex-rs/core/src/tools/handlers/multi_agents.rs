@@ -84,6 +84,8 @@ impl ToolHandler for MultiAgentHandler {
             "resume_agent" => resume_agent::handle(session, turn, call_id, arguments).await,
             "wait" => wait::handle(session, turn, call_id, arguments).await,
             "close_agent" => close_agent::handle(session, turn, call_id, arguments).await,
+            "list_agents" => list_agents::handle(session, turn, call_id, arguments).await,
+            "cancel_agents" => cancel_agents::handle(session, turn, call_id, arguments).await,
             other => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported collab tool {other}"
             ))),
@@ -446,6 +448,7 @@ mod resume_agent {
 pub(crate) mod wait {
     use super::*;
     use crate::agent::status::is_final;
+    use codex_protocol::protocol::TokenUsage;
     use futures::FutureExt;
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
@@ -467,6 +470,8 @@ pub(crate) mod wait {
     pub(crate) struct WaitResult {
         pub(crate) status: HashMap<ThreadId, AgentStatus>,
         pub(crate) timed_out: bool,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub(crate) token_usage: HashMap<String, TokenUsage>,
     }
 
     pub async fn handle(
@@ -601,9 +606,26 @@ pub(crate) mod wait {
         // Convert payload.
         let statuses_map = statuses.clone().into_iter().collect::<HashMap<_, _>>();
         let agent_statuses = build_wait_agent_statuses(&statuses_map, &receiver_agents);
+
+        // Collect token usage for agents that reached a final status.
+        let mut token_usage = HashMap::new();
+        for (thread_id, status) in &statuses_map {
+            if is_final(status) {
+                if let Some(usage) = session
+                    .services
+                    .agent_control
+                    .get_total_token_usage(*thread_id)
+                    .await
+                {
+                    token_usage.insert(thread_id.to_string(), usage);
+                }
+            }
+        }
+
         let result = WaitResult {
             status: statuses_map.clone(),
             timed_out: statuses.is_empty(),
+            token_usage,
         };
 
         // Final event emission.
@@ -744,6 +766,157 @@ pub mod close_agent {
             FunctionCallError::Fatal(format!("failed to serialize close_agent result: {err}"))
         })?;
 
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success: Some(true),
+        })
+    }
+}
+
+pub(crate) mod cancel_agents {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug, Deserialize)]
+    struct CancelAgentsArgs {
+        #[serde(default)]
+        ids: Option<Vec<String>>,
+        #[serde(default)]
+        all: Option<bool>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct CancelResult {
+        id: String,
+        success: bool,
+        status: AgentStatus,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct CancelAgentsResult {
+        cancelled: Vec<CancelResult>,
+        total_cancelled: usize,
+    }
+
+    pub async fn handle(
+        session: Arc<Session>,
+        _turn: Arc<TurnContext>,
+        _call_id: String,
+        arguments: String,
+    ) -> Result<ToolOutput, FunctionCallError> {
+        let args: CancelAgentsArgs = parse_arguments(&arguments)?;
+        let ids_to_cancel = if args.all == Some(true) {
+            session.services.agent_control.active_thread_ids()
+        } else if let Some(ids) = args.ids {
+            if ids.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "ids must be non-empty".to_owned(),
+                ));
+            }
+            ids.iter()
+                .map(|id| agent_id(id))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err(FunctionCallError::RespondToModel(
+                "Provide either 'ids' or 'all: true'".to_string(),
+            ));
+        };
+        let mut cancelled = Vec::with_capacity(ids_to_cancel.len());
+        for id in ids_to_cancel {
+            let result = session.services.agent_control.shutdown_agent(id).await;
+            let status = session.services.agent_control.get_status(id).await;
+            cancelled.push(CancelResult {
+                id: id.to_string(),
+                success: result.is_ok(),
+                status,
+            });
+        }
+        let total_cancelled = cancelled.iter().filter(|c| c.success).count();
+        let result = CancelAgentsResult {
+            cancelled,
+            total_cancelled,
+        };
+        let content = serde_json::to_string(&result).map_err(|err| {
+            FunctionCallError::Fatal(format!(
+                "failed to serialize cancel_agents result: {err}"
+            ))
+        })?;
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success: Some(true),
+        })
+    }
+}
+
+pub(crate) mod list_agents {
+    use super::*;
+    use codex_protocol::protocol::TokenUsage;
+    use std::sync::Arc;
+
+    #[derive(Debug, Serialize)]
+    struct AgentInfo {
+        id: String,
+        status: AgentStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_nickname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_role: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_usage: Option<TokenUsage>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ListAgentsResult {
+        agents: Vec<AgentInfo>,
+        running_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_threads: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        available_slots: Option<usize>,
+    }
+
+    pub async fn handle(
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        _call_id: String,
+        _arguments: String,
+    ) -> Result<ToolOutput, FunctionCallError> {
+        let mut active_ids = session.services.agent_control.active_thread_ids();
+        active_ids.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        let mut agents = Vec::with_capacity(active_ids.len());
+        for id in &active_ids {
+            let status = session.services.agent_control.get_status(*id).await;
+            let (nickname, role) = session
+                .services
+                .agent_control
+                .get_agent_nickname_and_role(*id)
+                .await
+                .unwrap_or((None, None));
+            let token_usage = session
+                .services
+                .agent_control
+                .get_total_token_usage(*id)
+                .await;
+            agents.push(AgentInfo {
+                id: id.to_string(),
+                status,
+                agent_nickname: nickname,
+                agent_role: role,
+                token_usage,
+            });
+        }
+        let running_count = agents.len();
+        let max_threads = turn.config.agent_max_threads;
+        let available_slots = max_threads.map(|max| max.saturating_sub(running_count));
+        let result = ListAgentsResult {
+            agents,
+            running_count,
+            max_threads,
+            available_slots,
+        };
+        let content = serde_json::to_string(&result).map_err(|err| {
+            FunctionCallError::Fatal(format!("failed to serialize list_agents result: {err}"))
+        })?;
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
             success: Some(true),
@@ -1696,7 +1869,8 @@ mod tests {
                     (id_a, AgentStatus::NotFound),
                     (id_b, AgentStatus::NotFound),
                 ]),
-                timed_out: false
+                timed_out: false,
+                token_usage: HashMap::new(),
             }
         );
         assert_eq!(success, None);
@@ -1737,7 +1911,8 @@ mod tests {
             result,
             wait::WaitResult {
                 status: HashMap::new(),
-                timed_out: true
+                timed_out: true,
+                token_usage: HashMap::new(),
             }
         );
         assert_eq!(success, None);
@@ -1834,7 +2009,8 @@ mod tests {
             result,
             wait::WaitResult {
                 status: HashMap::from([(agent_id, AgentStatus::Shutdown)]),
-                timed_out: false
+                timed_out: false,
+                token_usage: HashMap::new(),
             }
         );
         assert_eq!(success, None);
